@@ -24,8 +24,8 @@ android {
             if (keystoreFile != null) {
                 storeFile = file(keystoreFile)
                 storePassword = System.getenv("TRESOR_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("TRESOR_KEY_ALIAS")
-                keyPassword = System.getenv("TRESOR_KEY_PASSWORD")
+                keyAlias = System.getenv("TRESOR_KEY_ALIAS") ?: "tresor"
+                keyPassword = System.getenv("TRESOR_KEY_PASSWORD") ?: storePassword
             }
         }
     }

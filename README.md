@@ -36,7 +36,7 @@ Jeder Push auf `main` baut die App automatisch (Reiter **Actions** → letzter L
 Für eine Version mit Download-Seite ein Tag setzen, z. B. `v1.1` → die APK erscheint unter **Releases**.
 
 Installation auf dem Tablet: APK herunterladen → öffnen → „Installation aus dieser Quelle zulassen“.
-Alle Builds sind mit demselben Schlüssel signiert (Repository-Secrets `TRESOR_KEYSTORE_*`),
+Alle Builds sind mit demselben Schlüssel signiert (Repository-Secrets `TRESOR_KEYSTORE_BASE64` und `TRESOR_KEYSTORE_PASSWORD`),
 daher lassen sich Updates einfach über die bestehende Version installieren – die Tresor-Daten bleiben erhalten.
 
 ## Projekt öffnen und bauen

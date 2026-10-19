@@ -16,8 +16,6 @@ jobs:
     env:
       KEYSTORE_BASE64: ${{ secrets.TRESOR_KEYSTORE_BASE64 }}
       TRESOR_KEYSTORE_PASSWORD: ${{ secrets.TRESOR_KEYSTORE_PASSWORD }}
-      TRESOR_KEY_ALIAS: ${{ secrets.TRESOR_KEY_ALIAS }}
-      TRESOR_KEY_PASSWORD: ${{ secrets.TRESOR_KEY_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
