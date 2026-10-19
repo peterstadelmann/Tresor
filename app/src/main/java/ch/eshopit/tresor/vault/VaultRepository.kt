@@ -1,5 +1,6 @@
 package ch.eshopit.tresor.vault
 
+import android.provider.DocumentsContract.Document
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -29,7 +30,9 @@ data class VaultItem(
     val mime: String,
     val size: Long,
     val added: Long,
-    val hasThumb: Boolean
+    val hasThumb: Boolean,
+    /** Ordnerpfad bei Ordner-Import, z. B. "Urlaub/2024"; leer für einzelne Dateien. */
+    val folder: String = ""
 ) {
     val isImage: Boolean get() = mime.startsWith("image/")
     val isVideo: Boolean get() = mime.startsWith("video/")
@@ -66,14 +69,15 @@ class VaultRepository(private val context: Context) {
                         mime = json.getString("mime"),
                         size = json.getLong("size"),
                         added = json.getLong("added"),
-                        hasThumb = json.optBoolean("thumb", false)
+                        hasThumb = json.optBoolean("thumb", false),
+                        folder = json.optString("folder", "")
                     )
                 }.getOrNull()
             }
             .sortedByDescending { it.added }
 
     /** Verschlüsselt die Datei hinter [uri] in den Tresor. */
-    fun import(key: ByteArray, uri: Uri): VaultItem {
+    fun import(key: ByteArray, uri: Uri, folder: String = ""): VaultItem {
         val name = queryName(uri) ?: "Datei"
         val mime = resolver.getType(uri) ?: guessMime(name)
         val id = UUID.randomUUID().toString()
@@ -97,13 +101,14 @@ class VaultRepository(private val context: Context) {
                 thumbFile.writeBytes(Crypto.seal(key, thumb, aad("thumb", id)))
             }
 
-            val item = VaultItem(id, name, mime, size, System.currentTimeMillis(), thumb != null)
+            val item = VaultItem(id, name, mime, size, System.currentTimeMillis(), thumb != null, folder)
             val json = JSONObject()
                 .put("name", item.name)
                 .put("mime", item.mime)
                 .put("size", item.size)
                 .put("added", item.added)
                 .put("thumb", item.hasThumb)
+                .put("folder", item.folder)
             // Metadaten zuletzt schreiben: erst dann erscheint das Element in der Liste.
             File(dir, "$id.meta").writeBytes(Crypto.seal(key, json.toString().toByteArray(), aad("meta", id)))
             return item
@@ -180,6 +185,78 @@ class VaultRepository(private val context: Context) {
         listOf("meta", "data", "thumb").forEach { File(dir, "${item.id}.$it").delete() }
         File(sharedDir, item.id).deleteRecursively()
     }
+
+    // ---------------------------------------------------------------- Ganze Ordner
+
+    data class TreeFile(val uri: Uri, val folder: String)
+
+    /** Listet alle Dateien eines gewählten Ordners samt Unterordnern auf. */
+    fun listTree(treeUri: Uri): List<TreeFile> {
+        val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+        val rootName = queryName(DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId)) ?: "Ordner"
+        val result = mutableListOf<TreeFile>()
+        val queue = ArrayDeque<Pair<String, String>>()
+        queue.add(rootId to safeFolderName(rootName))
+        val columns = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE)
+        while (queue.isNotEmpty()) {
+            val (docId, path) = queue.removeAt(0)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            resolver.query(children, columns, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: continue
+                    if (c.getString(2) == Document.MIME_TYPE_DIR) {
+                        if (path.count { it == '/' } < MAX_FOLDER_DEPTH) queue.add(id to "$path/${safeFolderName(name)}")
+                    } else {
+                        result.add(TreeFile(DocumentsContract.buildDocumentUriUsingTree(treeUri, id), path))
+                    }
+                }
+            }
+            if (result.size > MAX_FOLDER_FILES) throw IOException("Mehr als $MAX_FOLDER_FILES Dateien im Ordner")
+        }
+        return result
+    }
+
+    /**
+     * Entschlüsselt [items] in den gewählten Zielordner. Der Ordner [baseFolder] wird dort
+     * mitsamt Unterordnern neu angelegt. Gibt die Anzahl fehlgeschlagener Dateien zurück.
+     */
+    fun exportToTree(
+        key: ByteArray,
+        items: List<VaultItem>,
+        baseFolder: String,
+        treeUri: Uri,
+        onProgress: (Int) -> Unit
+    ): Int {
+        val root = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+        val parentPrefix = baseFolder.substringBeforeLast('/', "").let { if (it.isEmpty()) "" else "$it/" }
+        val dirs = HashMap<String, Uri>()
+        dirs[""] = root
+        fun dir(path: String): Uri {
+            dirs[path]?.let { return it }
+            val parent = dir(path.substringBeforeLast('/', ""))
+            val created = DocumentsContract.createDocument(
+                resolver, parent, Document.MIME_TYPE_DIR, path.substringAfterLast('/')
+            ) ?: throw IOException("Ordner konnte nicht erstellt werden")
+            dirs[path] = created
+            return created
+        }
+        var failed = 0
+        items.forEachIndexed { index, item ->
+            onProgress(index)
+            val ok = runCatching {
+                val target = dir(item.folder.removePrefix(parentPrefix))
+                val file = DocumentsContract.createDocument(resolver, target, item.mime, item.name)
+                    ?: throw IOException("Datei konnte nicht erstellt werden")
+                export(key, item, file)
+            }.isSuccess
+            if (!ok) failed++
+        }
+        return failed
+    }
+
+    private fun safeFolderName(name: String): String =
+        name.replace('/', '_').trim().ifBlank { "Ordner" }
 
     // ---------------------------------------------------------------- Hilfsfunktionen
 
@@ -279,6 +356,8 @@ class VaultRepository(private val context: Context) {
 
     companion object {
         private const val THUMB_SIZE = 384
+        private const val MAX_FOLDER_DEPTH = 20
+        private const val MAX_FOLDER_FILES = 5000
         private const val MAX_VIEWER_BYTES = 200L * 1024 * 1024
     }
 }

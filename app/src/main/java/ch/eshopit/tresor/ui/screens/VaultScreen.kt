@@ -1,5 +1,11 @@
 package ch.eshopit.tresor.ui.screens
 
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.FilterChip
 import android.text.format.Formatter
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -95,12 +101,18 @@ fun VaultScreen(
     var addMenu by remember { mutableStateOf(false) }
     var sheetItem by remember { mutableStateOf<VaultItem?>(null) }
     var confirmDelete by remember { mutableStateOf<VaultItem?>(null) }
+    var folderSel by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmFolderDelete by remember { mutableStateOf<String?>(null) }
 
-    val shown = when (filter) {
+    val folders = state.items.map { it.folder }.filter { it.isNotEmpty() }.distinct().sorted()
+    val activeFolder = folderSel?.takeIf { it in folders }
+    val shownByType = when (filter) {
         1 -> state.items.filter { it.isImage || it.isVideo }
         2 -> state.items.filterNot { it.isImage || it.isVideo }
         else -> state.items
     }
+    val shown = if (activeFolder == null) shownByType
+    else shownByType.filter { it.folder == activeFolder || it.folder.startsWith("$activeFolder/") }
 
     Scaffold(
         topBar = {
@@ -131,6 +143,11 @@ fun VaultScreen(
                         leadingIcon = { Icon(Icons.Filled.Description, null) },
                         onClick = { addMenu = false; actions.import(arrayOf("*/*")) }
                     )
+                    DropdownMenuItem(
+                        text = { Text("Ganzer Ordner") },
+                        leadingIcon = { Icon(Icons.Filled.Folder, null) },
+                        onClick = { addMenu = false; actions.importFolder() }
+                    )
                 }
             }
         },
@@ -143,6 +160,15 @@ fun VaultScreen(
                 }
             }
             state.busy?.let { BusyBar(it) }
+            if (folders.isNotEmpty()) {
+                FolderBar(
+                    folders = folders,
+                    selected = activeFolder,
+                    onSelect = { folderSel = it },
+                    onExport = actions.exportFolder,
+                    onDelete = { confirmFolderDelete = it }
+                )
+            }
 
             if (shown.isEmpty()) {
                 EmptyState(Modifier.weight(1f))
@@ -185,6 +211,24 @@ fun VaultScreen(
                 SheetAction(Icons.Filled.Delete, "Löschen", danger = true) { sheetItem = null; confirmDelete = item }
             }
         }
+    }
+
+    confirmFolderDelete?.let { folder ->
+        AlertDialog(
+            onDismissRequest = { confirmFolderDelete = null },
+            title = { Text("Ordner löschen?") },
+            text = {
+                Text("Alle ${vm.itemsInFolder(folder).size} Dateien in „$folder“ werden endgültig aus dem Tresor gelöscht.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmFolderDelete = null
+                    folderSel = null
+                    vm.deleteFolder(folder)
+                }) { Text("Löschen", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmFolderDelete = null }) { Text("Abbrechen") } }
+        )
     }
 
     confirmDelete?.let { item ->
@@ -310,4 +354,53 @@ private fun iconFor(mime: String): ImageVector = when {
     mime == "application/pdf" -> Icons.Filled.PictureAsPdf
     mime.contains("zip") || mime.contains("compressed") || mime.contains("tar") -> Icons.Filled.FolderZip
     else -> Icons.Filled.Description
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FolderBar(
+    folders: List<String>,
+    selected: String?,
+    onSelect: (String?) -> Unit,
+    onExport: (String) -> Unit,
+    onDelete: (String) -> Unit
+) {
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp)
+    ) {
+        item {
+            FilterChip(selected = selected == null, onClick = { onSelect(null) }, label = { Text("Alle") })
+        }
+        items(folders) { folder ->
+            FilterChip(
+                selected = selected == folder,
+                onClick = { onSelect(if (selected == folder) null else folder) },
+                label = { Text(folder) },
+                leadingIcon = { Icon(Icons.Filled.Folder, null, Modifier.size(18.dp)) }
+            )
+        }
+    }
+    if (selected != null) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            AssistChip(
+                onClick = { onExport(selected) },
+                label = { Text("Ordner entschlüsseln") },
+                leadingIcon = { Icon(Icons.Filled.Download, null, Modifier.size(18.dp)) }
+            )
+            AssistChip(
+                onClick = { onDelete(selected) },
+                label = { Text("Ordner löschen") },
+                leadingIcon = { Icon(Icons.Filled.Delete, null, Modifier.size(18.dp)) }
+            )
+        }
+    }
 }

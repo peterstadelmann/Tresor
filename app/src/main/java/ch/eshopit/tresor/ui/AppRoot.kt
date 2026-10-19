@@ -34,7 +34,9 @@ import kotlinx.coroutines.launch
 class VaultActions(
     val import: (Array<String>) -> Unit,
     val export: (VaultItem) -> Unit,
-    val openWith: (VaultItem) -> Unit
+    val openWith: (VaultItem) -> Unit,
+    val importFolder: () -> Unit,
+    val exportFolder: (String) -> Unit
 )
 
 @Composable
@@ -60,6 +62,14 @@ fun AppRoot(
         VaultSession.externalActionPending = false
         if (uris.isNotEmpty()) vm.importUris(uris)
     }
+    val folderImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        VaultSession.externalActionPending = false
+        if (uri != null) vm.importFolder(uri)
+    }
+    val folderExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        VaultSession.externalActionPending = false
+        vm.finishFolderExport(uri)
+    }
     val exportLauncher = rememberLauncherForActivityResult(CreateDocumentContract()) { uri ->
         VaultSession.externalActionPending = false
         vm.finishExport(uri)
@@ -75,6 +85,15 @@ fun AppRoot(
                 vm.pendingExportId = item.id
                 VaultSession.externalActionPending = true
                 exportLauncher.launch(item.name to item.mime)
+            },
+            importFolder = {
+                VaultSession.externalActionPending = true
+                folderImportLauncher.launch(null)
+            },
+            exportFolder = { folder ->
+                vm.pendingExportFolder = folder
+                VaultSession.externalActionPending = true
+                folderExportLauncher.launch(null)
             },
             openWith = { item ->
                 scope.launch {

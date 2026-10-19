@@ -210,7 +210,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(items = items) }
     }
 
-    fun importUris(uris: List<Uri>) {
+    fun importUris(uris: List<Uri>) = importSources(uris.map { it to "" })
+
+    /** Verschlüsselt alle Dateien eines Ordners (inkl. Unterordner); die Struktur bleibt erhalten. */
+    fun importFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = "Ordner wird gelesen …") }
+            val files = withContext(Dispatchers.IO) { runCatching { repo.listTree(treeUri) } }
+            _state.update { it.copy(busy = null) }
+            files
+                .onSuccess { list ->
+                    if (list.isEmpty()) showMessage("Der Ordner enthält keine Dateien")
+                    else importSources(list.map { it.uri to it.folder })
+                }
+                .onFailure { showMessage("Ordner konnte nicht gelesen werden: ${it.message}") }
+        }
+    }
+
+    private fun importSources(sources: List<Pair<Uri, String>>) {
         viewModelScope.launch {
             val key = try {
                 VaultSession.keyCopy()
@@ -222,9 +239,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             var originalsKept = 0
             try {
-                uris.forEachIndexed { index, uri ->
-                    _state.update { it.copy(busy = "Verschlüssele ${index + 1} von ${uris.size} …") }
-                    val result = withContext(Dispatchers.IO) { runCatching { repo.import(key, uri) } }
+                sources.forEachIndexed { index, (uri, folder) ->
+                    _state.update { it.copy(busy = "Verschlüssele ${index + 1} von ${sources.size} …") }
+                    val result = withContext(Dispatchers.IO) { runCatching { repo.import(key, uri, folder) } }
                     if (result.isSuccess) {
                         ok++
                         if (deleteOriginals && !withContext(Dispatchers.IO) { repo.deleteOriginal(uri) }) {
@@ -244,6 +261,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (failed > 0) append(", $failed fehlgeschlagen")
                 if (originalsKept > 0) append(". $originalsKept Original(e) konnten nicht gelöscht werden")
             })
+        }
+    }
+
+    // ---------------------------------------------------------------- Ordner im Tresor
+
+    /** Ordner, der gerade über die Ordnerauswahl entschlüsselt wird. */
+    var pendingExportFolder: String? = null
+
+    fun itemsInFolder(folder: String): List<VaultItem> =
+        _state.value.items.filter { it.folder == folder || it.folder.startsWith("$folder/") }
+
+    fun finishFolderExport(treeUri: Uri?) {
+        val folder = pendingExportFolder
+        pendingExportFolder = null
+        if (treeUri == null || folder == null) return
+        val items = itemsInFolder(folder)
+        if (items.isEmpty()) return
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    withKey { key ->
+                        repo.exportToTree(key, items, folder, treeUri) { i ->
+                            _state.update { it.copy(busy = "Entschlüssele ${i + 1} von ${items.size} …") }
+                        }
+                    }
+                }
+            }
+            _state.update { it.copy(busy = null) }
+            result
+                .onSuccess { failed ->
+                    showMessage(
+                        if (failed == 0) "Ordner „${folder.substringAfterLast('/')}“ entschlüsselt (${items.size} Dateien)"
+                        else "${items.size - failed} Dateien entschlüsselt, $failed fehlgeschlagen"
+                    )
+                }
+                .onFailure { showMessage("Entschlüsseln fehlgeschlagen: ${it.message}") }
+        }
+    }
+
+    fun deleteFolder(folder: String) {
+        val items = itemsInFolder(folder)
+        val ids = items.map { it.id }.toSet()
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { items.forEach(repo::delete) }
+            ids.forEach(thumbCache::remove)
+            _state.update { s -> s.copy(items = s.items.filterNot { it.id in ids }) }
+            showMessage("Ordner „${folder.substringAfterLast('/')}“ gelöscht (${items.size} Dateien)")
         }
     }
 
