@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tresor</string>
+    <string name="app_lock_service_label">Tresor App-Sperre</string>
+    <string name="app_lock_service_description">Sperrt ausgewählte Apps mit deinem Tresor-Code oder Fingerabdruck. Der Dienst erkennt nur, welche App geöffnet wird, und liest keine Bildschirminhalte.</string>
+</resources>
