@@ -41,6 +41,8 @@ class VaultActions(
     val importFolder: () -> Unit,
     /** Tresor-Ordner in einen frei gewählten Zielordner entschlüsseln (optional danach entfernen). */
     val exportFolder: (path: String, removeAfter: Boolean) -> Unit,
+    /** Mehrere ausgewählte Dateien/Ordner in einen gewählten Zielordner entschlüsseln. */
+    val exportSelection: (itemIds: Set<String>, folders: Set<String>, removeAfter: Boolean) -> Unit,
     /** Android-Berechtigung "Zugriff auf alle Dateien" anfragen. */
     val requestStorageAccess: () -> Unit
 )
@@ -76,6 +78,10 @@ fun AppRoot(
         VaultSession.externalActionPending = false
         vm.finishFolderExport(uri)
     }
+    val bulkExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        VaultSession.externalActionPending = false
+        vm.finishBulkExport(uri)
+    }
     val storagePermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         VaultSession.externalActionPending = false
     }
@@ -103,6 +109,11 @@ fun AppRoot(
                 vm.pendingFolderExport = AppViewModel.FolderExport(path, removeAfter)
                 VaultSession.externalActionPending = true
                 folderExportLauncher.launch(null)
+            },
+            exportSelection = { itemIds, folders, removeAfter ->
+                vm.pendingBulkExport = AppViewModel.BulkExport(itemIds, folders, removeAfter)
+                VaultSession.externalActionPending = true
+                bulkExportLauncher.launch(null)
             },
             requestStorageAccess = {
                 VaultSession.externalActionPending = true

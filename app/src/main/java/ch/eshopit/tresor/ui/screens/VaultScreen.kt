@@ -120,6 +120,7 @@ fun VaultScreen(
     // Mehrfachauswahl: Datei-IDs und Ordner als "dir:<pfad>"
     var selection by remember { mutableStateOf(setOf<String>()) }
     var confirmBulkDelete by remember { mutableStateOf(false) }
+    var confirmBulkDecrypt by remember { mutableStateOf(false) }
     val selectionMode = selection.isNotEmpty()
     fun toggle(key: String) {
         selection = if (key in selection) selection - key else selection + key
@@ -177,6 +178,7 @@ fun VaultScreen(
                         IconButton(onClick = {
                             selection = subFolders.map { "dir:$it" }.toSet() + shownFiles.map { it.id }
                         }) { Icon(Icons.Filled.SelectAll, "Alle auswählen") }
+                        IconButton(onClick = { confirmBulkDecrypt = true }) { Icon(Icons.Filled.Download, "Entschlüsseln") }
                         IconButton(onClick = { confirmBulkDelete = true }) { Icon(Icons.Filled.Delete, "Löschen") }
                     }
                 )
@@ -363,6 +365,40 @@ fun VaultScreen(
                 }) { Text("Löschen", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmFolderDelete = null }) { Text("Abbrechen") } }
+        )
+    }
+
+    if (confirmBulkDecrypt) {
+        val folders = selection.filter { it.startsWith("dir:") }.map { it.removePrefix("dir:") }.toSet()
+        val ids = selection.filterNot { it.startsWith("dir:") }.toSet()
+        val fileCount = ids.size + folders.sumOf { vm.itemsInFolder(it).size }
+        var remove by remember { mutableStateOf(vm.deleteOriginals) }
+        AlertDialog(
+            onDismissRequest = { confirmBulkDecrypt = false },
+            title = { Text("Auswahl entschlüsseln") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "$fileCount Datei(en) werden in einen Ordner deiner Wahl entschlüsselt. " +
+                            "Ausgewählte Ordner behalten ihre Unterordner."
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.clickable { remove = !remove }
+                    ) {
+                        Checkbox(checked = remove, onCheckedChange = { remove = it })
+                        Text("Danach aus dem Tresor entfernen")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmBulkDecrypt = false
+                    selection = emptySet()
+                    actions.exportSelection(ids, folders, remove)
+                }) { Text("Zielordner wählen") }
+            },
+            dismissButton = { TextButton(onClick = { confirmBulkDecrypt = false }) { Text("Abbrechen") } }
         )
     }
 

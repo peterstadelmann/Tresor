@@ -409,6 +409,67 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return record.dirs.filter { it.startsWith("$rel/") }.map { it.removePrefix("$rel/") }
     }
 
+    data class BulkExport(val itemIds: Set<String>, val folders: Set<String>, val removeAfter: Boolean)
+
+    /** Auswahl, die gerade über die Ordnerauswahl entschlüsselt wird. */
+    var pendingBulkExport: BulkExport? = null
+
+    /**
+     * Entschlüsselt mehrere ausgewählte Dateien und Ordner in einen gewählten Zielordner.
+     * Dateien landen direkt darin, Ordner mit ihrer kompletten Struktur.
+     */
+    fun finishBulkExport(treeUri: Uri?) {
+        val task = pendingBulkExport
+        pendingBulkExport = null
+        if (treeUri == null || task == null) return
+        val files = _state.value.items.filter { it.id in task.itemIds }
+        val folders = task.folders.toList()
+        val total = files.size + folders.sumOf { itemsInFolder(it).size }
+        viewModelScope.launch {
+            var done = 0
+            val progress: (Int) -> Unit = { _ ->
+                done++
+                _state.update { it.copy(busy = "Entschlüssele ${minOf(done, total)} von $total …") }
+            }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    withKey { key ->
+                        var failed = 0
+                        files.groupBy { it.folder }.forEach { (folder, group) ->
+                            failed += repo.exportToTree(key, group, folder, "", emptyList(), treeUri, progress)
+                        }
+                        folders.forEach { path ->
+                            val record = folderRecord(path)
+                            failed += repo.exportToTree(
+                                key, itemsInFolder(path), path,
+                                record?.origName ?: path.substringAfterLast('/'),
+                                record?.dirs ?: dirsBelow(path),
+                                treeUri, progress
+                            )
+                        }
+                        failed
+                    }
+                }
+            }
+            _state.update { it.copy(busy = null) }
+            result
+                .onSuccess { failed ->
+                    if (failed > 0) {
+                        showMessage("${total - failed} von $total Dateien entschlüsselt, $failed fehlgeschlagen – nichts wurde aus dem Tresor entfernt")
+                        return@onSuccess
+                    }
+                    if (task.removeAfter) {
+                        withContext(Dispatchers.IO) { files.forEach(repo::delete) }
+                        files.forEach { thumbCache.remove(it.id) }
+                        folders.forEach { removeFolder(it) }
+                        refresh()
+                    }
+                    showMessage("$total Datei(en) entschlüsselt" + if (task.removeAfter) " und aus dem Tresor entfernt" else "")
+                }
+                .onFailure { showMessage("Entschlüsseln fehlgeschlagen: ${it.message}") }
+        }
+    }
+
     /** Löscht mehrere Dateien und Ordner auf einmal aus dem Tresor. */
     fun deleteMany(itemIds: Set<String>, folders: Set<String>) {
         viewModelScope.launch {

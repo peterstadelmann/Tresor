@@ -380,14 +380,15 @@ class VaultRepository(private val context: Context) {
             dirs[path] = created
             return created
         }
+        fun join(a: String, b: String) = if (a.isEmpty()) b else if (b.isEmpty()) a else "$a/$b"
         dir(targetName)
-        extraDirs.forEach { runCatching { dir("$targetName/$it") } }
+        extraDirs.forEach { runCatching { dir(join(targetName, it)) } }
         var failed = 0
         items.forEachIndexed { index, item ->
             onProgress(index)
             val ok = runCatching {
                 val rel = item.folder.removePrefix(vaultBase).removePrefix("/")
-                val target = dir(if (rel.isEmpty()) targetName else "$targetName/$rel")
+                val target = dir(join(targetName, rel))
                 val file = DocumentsContract.createDocument(resolver, target, item.mime, item.name)
                     ?: throw IOException("Datei konnte nicht erstellt werden")
                 export(key, item, file)
