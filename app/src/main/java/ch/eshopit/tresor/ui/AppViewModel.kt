@@ -409,6 +409,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return record.dirs.filter { it.startsWith("$rel/") }.map { it.removePrefix("$rel/") }
     }
 
+    /** Löscht mehrere Dateien und Ordner auf einmal aus dem Tresor. */
+    fun deleteMany(itemIds: Set<String>, folders: Set<String>) {
+        viewModelScope.launch {
+            val items = _state.value.items.filter { it.id in itemIds }
+            val count = items.size + folders.sumOf { itemsInFolder(it).size }
+            withContext(Dispatchers.IO) { items.forEach(repo::delete) }
+            items.forEach { thumbCache.remove(it.id) }
+            folders.forEach { removeFolder(it) }
+            refresh()
+            showMessage("$count Datei(en) gelöscht")
+        }
+    }
+
     fun deleteFolder(path: String) {
         viewModelScope.launch {
             val count = itemsInFolder(path).size

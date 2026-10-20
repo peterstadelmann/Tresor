@@ -5,6 +5,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,11 +25,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
@@ -43,6 +47,7 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Restore
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -112,6 +117,13 @@ fun VaultScreen(
     var folderSheet by remember { mutableStateOf<String?>(null) }
     var restoreFolder by remember { mutableStateOf<String?>(null) }
     var confirmFolderDelete by remember { mutableStateOf<String?>(null) }
+    // Mehrfachauswahl: Datei-IDs und Ordner als "dir:<pfad>"
+    var selection by remember { mutableStateOf(setOf<String>()) }
+    var confirmBulkDelete by remember { mutableStateOf(false) }
+    val selectionMode = selection.isNotEmpty()
+    fun toggle(key: String) {
+        selection = if (key in selection) selection - key else selection + key
+    }
 
     // Berechtigung "Zugriff auf alle Dateien" nach Rückkehr aus den Einstellungen neu prüfen
     var storageGranted by remember { mutableStateOf(StorageAccess.granted(context)) }
@@ -128,7 +140,8 @@ fun VaultScreen(
     // Ordner verschwunden (z. B. gelöscht)? Zurück zur obersten Ebene.
     val path = if (currentPath.isEmpty() || currentPath in allFolders) currentPath else ""
     val parentPath = path.substringBeforeLast('/', "")
-    BackHandler(enabled = path.isNotEmpty()) { currentPath = parentPath }
+    BackHandler(enabled = path.isNotEmpty() && !selectionMode) { currentPath = parentPath }
+    BackHandler(enabled = selectionMode) { selection = emptySet() }
 
     val subFolders = allFolders.filter { it.substringBeforeLast('/', "") == path && it.isNotEmpty() }.sorted()
     val filesHere = state.items.filter { it.folder == path }
@@ -140,7 +153,34 @@ fun VaultScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
+            if (selectionMode) {
+                val selectedFolders = selection.filter { it.startsWith("dir:") }.map { it.removePrefix("dir:") }
+                val selectedItems = state.items.filter { it.id in selection }
+                TopAppBar(
+                    title = { Text("${selection.size} ausgewählt") },
+                    navigationIcon = {
+                        IconButton(onClick = { selection = emptySet() }) { Icon(Icons.Filled.Close, "Auswahl beenden") }
+                    },
+                    actions = {
+                        if (selection.size == 1 && selectedFolders.size == 1) {
+                            IconButton(onClick = {
+                                restoreFolder = selectedFolders.first()
+                                selection = emptySet()
+                            }) { Icon(Icons.Filled.Restore, "Ordner wiederherstellen") }
+                        }
+                        if (selection.size == 1 && selectedItems.size == 1) {
+                            IconButton(onClick = {
+                                sheetItem = selectedItems.first()
+                                selection = emptySet()
+                            }) { Icon(Icons.Filled.MoreVert, "Weitere Aktionen") }
+                        }
+                        IconButton(onClick = {
+                            selection = subFolders.map { "dir:$it" }.toSet() + shownFiles.map { it.id }
+                        }) { Icon(Icons.Filled.SelectAll, "Alle auswählen") }
+                        IconButton(onClick = { confirmBulkDelete = true }) { Icon(Icons.Filled.Delete, "Löschen") }
+                    }
+                )
+            } else TopAppBar(
                 title = {
                     Text(
                         if (path.isEmpty()) "Tresor" else path.substringAfterLast('/'),
@@ -165,7 +205,7 @@ fun VaultScreen(
             )
         },
         floatingActionButton = {
-            if (path.isEmpty()) {
+            if (path.isEmpty() && !selectionMode) {
                 Box {
                     ExtendedFloatingActionButton(
                         onClick = { addMenu = true },
@@ -232,16 +272,24 @@ fun VaultScreen(
                         FolderCell(
                             name = folder.substringAfterLast('/'),
                             fileCount = vm.itemsInFolder(folder).size,
-                            onClick = { currentPath = folder },
-                            onLongClick = { folderSheet = folder }
+                            selected = "dir:$folder" in selection,
+                            onClick = { if (selectionMode) toggle("dir:$folder") else currentPath = folder },
+                            onLongClick = { toggle("dir:$folder") }
                         )
                     }
                     items(shownFiles, key = { it.id }) { item ->
                         ItemCell(
                             item = item,
                             loadThumb = vm::thumbnail,
-                            onClick = { if (item.isImage) vm.openViewer(item) else sheetItem = item },
-                            onLongClick = { sheetItem = item }
+                            selected = item.id in selection,
+                            onClick = {
+                                when {
+                                    selectionMode -> toggle(item.id)
+                                    item.isImage -> vm.openViewer(item)
+                                    else -> sheetItem = item
+                                }
+                            },
+                            onLongClick = { toggle(item.id) }
                         )
                     }
                 }
@@ -315,6 +363,31 @@ fun VaultScreen(
                 }) { Text("Löschen", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmFolderDelete = null }) { Text("Abbrechen") } }
+        )
+    }
+
+    if (confirmBulkDelete) {
+        val folders = selection.filter { it.startsWith("dir:") }.map { it.removePrefix("dir:") }
+        val ids = selection.filterNot { it.startsWith("dir:") }.toSet()
+        val fileCount = ids.size + folders.sumOf { vm.itemsInFolder(it).size }
+        AlertDialog(
+            onDismissRequest = { confirmBulkDelete = false },
+            title = { Text("Endgültig löschen?") },
+            text = {
+                Text(buildString {
+                    append("$fileCount Datei(en)")
+                    if (folders.isNotEmpty()) append(" in ${folders.size} Ordner(n) und einzeln")
+                    append(" werden aus dem Tresor gelöscht und können nicht wiederhergestellt werden.")
+                })
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmBulkDelete = false
+                    selection = emptySet()
+                    vm.deleteMany(ids, folders.toSet())
+                }) { Text("Löschen", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmBulkDelete = false }) { Text("Abbrechen") } }
         )
     }
 
@@ -472,10 +545,17 @@ private fun EmptyState(modifier: Modifier) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FolderCell(name: String, fileCount: Int, onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun FolderCell(
+    name: String,
+    fileCount: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
     Card(
         modifier = Modifier
             .clip(MaterialTheme.shapes.medium)
+            .selectionBorder(selected)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
     ) {
         Box(
@@ -490,6 +570,7 @@ private fun FolderCell(name: String, fileCount: Int, onClick: () -> Unit, onLong
                 Modifier.size(56.dp),
                 tint = MaterialTheme.colorScheme.onSecondaryContainer
             )
+            SelectedMark(selected)
         }
         Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
             Text(name, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -510,6 +591,7 @@ private fun FolderCell(name: String, fileCount: Int, onClick: () -> Unit, onLong
 private fun ItemCell(
     item: VaultItem,
     loadThumb: suspend (VaultItem) -> ImageBitmap?,
+    selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
@@ -517,6 +599,7 @@ private fun ItemCell(
     Card(
         modifier = Modifier
             .clip(MaterialTheme.shapes.medium)
+            .selectionBorder(selected)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
     ) {
         Box(
@@ -544,6 +627,7 @@ private fun ItemCell(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            SelectedMark(selected)
         }
         Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
             Text(
@@ -568,4 +652,23 @@ private fun iconFor(mime: String): ImageVector = when {
     mime == "application/pdf" -> Icons.Filled.PictureAsPdf
     mime.contains("zip") || mime.contains("compressed") || mime.contains("tar") -> Icons.Filled.FolderZip
     else -> Icons.Filled.Description
+}
+
+@Composable
+private fun Modifier.selectionBorder(selected: Boolean): Modifier =
+    if (selected) border(3.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.medium) else this
+
+/** Häkchen oben rechts auf ausgewählten Kacheln (innerhalb einer Box). */
+@Composable
+private fun SelectedMark(selected: Boolean) {
+    if (!selected) return
+    Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopEnd) {
+        Icon(
+            Icons.Filled.CheckCircle, "Ausgewählt",
+            Modifier
+                .size(26.dp)
+                .background(MaterialTheme.colorScheme.surface, CircleShape),
+            tint = MaterialTheme.colorScheme.primary
+        )
+    }
 }
