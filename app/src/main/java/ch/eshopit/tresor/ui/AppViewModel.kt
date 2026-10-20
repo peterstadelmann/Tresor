@@ -507,7 +507,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         repo.saveFolder(key, parent.copy(dirs = parent.dirs.filterNot { it == rel || it.startsWith("$rel/") }))
                     }
                 }
+                else -> Unit
             }
+            Unit
         }
         ids.forEach(thumbCache::remove)
         refresh()
