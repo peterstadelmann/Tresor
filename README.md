@@ -7,7 +7,8 @@ Paket: `ch.eshopit.tresor` · eShop IT Solutions GmbH
 
 - **Verschlüsseln**: Bilder, Videos und beliebige Dateien über die Android-Dateiauswahl in den Tresor aufnehmen (Mehrfachauswahl).
 - **Entschlüsseln**: Element als Klartext an einem frei wählbaren Ort speichern („Entschlüsseln & speichern“) oder kurzzeitig mit einer anderen App öffnen („Öffnen mit …“).
-- **Ganze Ordner**: „Verschlüsseln → Ganzer Ordner“ übernimmt alle Dateien inkl. Unterordner; die Ordner erscheinen im Tresor als Filter und lassen sich gesamthaft wieder entschlüsseln (Struktur bleibt erhalten) oder löschen. Android erlaubt nicht die Auswahl von „Download“ oder dem Speicher-Hauptverzeichnis selbst – einen Unterordner wählen.
+- **Ganze Ordner**: „Verschlüsseln → Ganzer Ordner“ übernimmt alle Dateien inkl. Unterordner (auch leere) und legt im Tresor einen Ordner an, durch den man wie im Datei-Explorer navigiert. Ist „Originale löschen“ aktiv und wurde alles übernommen, wird der Originalordner komplett gelöscht.
+- **Wiederherstellen**: Ordner gedrückt halten bzw. ⋮ im Ordner → „Wiederherstellen“. Am Originalort entstehen wieder derselbe Ordner, dieselben Unterordner, Dateinamen und Änderungsdaten (benötigt die Berechtigung „Zugriff auf alle Dateien“, die Tresor bei Bedarf anfragt). Alternativ einen anderen Zielordner wählen. Optional danach aus dem Tresor entfernen.
 - **Bildbetrachter** direkt in der App (Zoom mit zwei Fingern, Doppeltipp), verschlüsselte Vorschaubilder im Raster.
 - **App-Sperre** mit Code (6–12 Ziffern) und optional **Fingerabdruck** (Android BiometricPrompt, Klasse „stark“).
 - Automatische Sperre, sobald die App in den Hintergrund geht; Screenshots und App-Übersicht-Vorschau sind blockiert (`FLAG_SECURE`).

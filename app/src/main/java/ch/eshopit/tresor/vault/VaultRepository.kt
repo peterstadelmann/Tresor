@@ -1,20 +1,23 @@
 package ch.eshopit.tresor.vault
 
-import android.provider.DocumentsContract.Document
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.media.MediaMetadataRetriever
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.annotation.RequiresApi
 import androidx.core.content.FileProvider
 import ch.eshopit.tresor.crypto.Crypto
 import ch.eshopit.tresor.crypto.FileCrypto
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -32,17 +35,34 @@ data class VaultItem(
     val added: Long,
     val hasThumb: Boolean,
     /** Ordnerpfad bei Ordner-Import, z. B. "Urlaub/2024"; leer für einzelne Dateien. */
-    val folder: String = ""
+    val folder: String = "",
+    /** Ursprüngliches Änderungsdatum der Datei (0 = unbekannt). */
+    val mtime: Long = 0L
 ) {
     val isImage: Boolean get() = mime.startsWith("image/")
     val isVideo: Boolean get() = mime.startsWith("video/")
 }
 
 /**
+ * Ein ganzer Ordner im Tresor. [name] ist der Name im Tresor (eindeutig), [origName] und
+ * [origPath] beschreiben das Original; [dirs] enthält alle Unterordner relativ zum Ordner,
+ * auch leere, damit beim Wiederherstellen die Struktur exakt gleich ist.
+ */
+data class FolderRecord(
+    val id: String,
+    val name: String,
+    val origName: String,
+    val origPath: String?,
+    val dirs: List<String>,
+    val added: Long
+)
+
+/**
  * Speichert verschlüsselte Elemente im privaten App-Speicher:
  *   <id>.data  – Inhalt (FileCrypto-Format)
  *   <id>.meta  – Name, Typ, Grösse (AES-GCM)
  *   <id>.thumb – Vorschaubild für Bilder/Videos (AES-GCM, optional)
+ *   <id>.dir   – Ordner-Datensatz (AES-GCM)
  * Dateinamen verraten nichts über den Inhalt.
  */
 class VaultRepository(private val context: Context) {
@@ -70,14 +90,15 @@ class VaultRepository(private val context: Context) {
                         size = json.getLong("size"),
                         added = json.getLong("added"),
                         hasThumb = json.optBoolean("thumb", false),
-                        folder = json.optString("folder", "")
+                        folder = json.optString("folder", ""),
+                        mtime = json.optLong("mtime", 0L)
                     )
                 }.getOrNull()
             }
             .sortedByDescending { it.added }
 
     /** Verschlüsselt die Datei hinter [uri] in den Tresor. */
-    fun import(key: ByteArray, uri: Uri, folder: String = ""): VaultItem {
+    fun import(key: ByteArray, uri: Uri, folder: String = "", mtime: Long = 0L): VaultItem {
         val name = queryName(uri) ?: "Datei"
         val mime = resolver.getType(uri) ?: guessMime(name)
         val id = UUID.randomUUID().toString()
@@ -101,7 +122,7 @@ class VaultRepository(private val context: Context) {
                 thumbFile.writeBytes(Crypto.seal(key, thumb, aad("thumb", id)))
             }
 
-            val item = VaultItem(id, name, mime, size, System.currentTimeMillis(), thumb != null, folder)
+            val item = VaultItem(id, name, mime, size, System.currentTimeMillis(), thumb != null, folder, mtime)
             val json = JSONObject()
                 .put("name", item.name)
                 .put("mime", item.mime)
@@ -109,6 +130,7 @@ class VaultRepository(private val context: Context) {
                 .put("added", item.added)
                 .put("thumb", item.hasThumb)
                 .put("folder", item.folder)
+                .put("mtime", item.mtime)
             // Metadaten zuletzt schreiben: erst dann erscheint das Element in der Liste.
             File(dir, "$id.meta").writeBytes(Crypto.seal(key, json.toString().toByteArray(), aad("meta", id)))
             return item
@@ -188,48 +210,165 @@ class VaultRepository(private val context: Context) {
 
     // ---------------------------------------------------------------- Ganze Ordner
 
-    data class TreeFile(val uri: Uri, val folder: String)
+    data class TreeFile(val uri: Uri, val rel: String, val mtime: Long)
 
-    /** Listet alle Dateien eines gewählten Ordners samt Unterordnern auf. */
-    fun listTree(treeUri: Uri): List<TreeFile> {
+    data class TreeScan(
+        val name: String,
+        val rootDocUri: Uri,
+        val origPath: String?,
+        val files: List<TreeFile>,
+        /** Alle Unterordner relativ zum gewählten Ordner, z. B. "2024", "2024/Juli". */
+        val dirs: List<String>,
+        /** true, wenn Unterordner wegen zu grosser Tiefe übersprungen wurden. */
+        val truncated: Boolean
+    )
+
+    /** Liest einen gewählten Ordner samt Unterordnern (auch leere) ein. */
+    fun scanTree(treeUri: Uri): TreeScan {
         val rootId = DocumentsContract.getTreeDocumentId(treeUri)
-        val rootName = queryName(DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId)) ?: "Ordner"
-        val result = mutableListOf<TreeFile>()
+        val rootDoc = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId)
+        val name = safeFolderName(queryName(rootDoc) ?: rootId.substringAfterLast(':').substringAfterLast('/'))
+        val files = mutableListOf<TreeFile>()
+        val dirs = mutableListOf<String>()
+        var truncated = false
         val queue = ArrayDeque<Pair<String, String>>()
-        queue.add(rootId to safeFolderName(rootName))
-        val columns = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE)
+        queue.add(rootId to "")
+        val columns = arrayOf(
+            Document.COLUMN_DOCUMENT_ID,
+            Document.COLUMN_DISPLAY_NAME,
+            Document.COLUMN_MIME_TYPE,
+            Document.COLUMN_LAST_MODIFIED
+        )
         while (queue.isNotEmpty()) {
-            val (docId, path) = queue.removeAt(0)
+            val (docId, rel) = queue.removeAt(0)
             val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
             resolver.query(children, columns, null, null, null)?.use { c ->
                 while (c.moveToNext()) {
                     val id = c.getString(0) ?: continue
-                    val name = c.getString(1) ?: continue
+                    val childName = c.getString(1) ?: continue
                     if (c.getString(2) == Document.MIME_TYPE_DIR) {
-                        if (path.count { it == '/' } < MAX_FOLDER_DEPTH) queue.add(id to "$path/${safeFolderName(name)}")
+                        val childRel = if (rel.isEmpty()) safeFolderName(childName) else "$rel/${safeFolderName(childName)}"
+                        if (childRel.count { it == '/' } < MAX_FOLDER_DEPTH) {
+                            dirs.add(childRel)
+                            queue.add(id to childRel)
+                        } else {
+                            truncated = true
+                        }
                     } else {
-                        result.add(TreeFile(DocumentsContract.buildDocumentUriUsingTree(treeUri, id), path))
+                        files.add(TreeFile(DocumentsContract.buildDocumentUriUsingTree(treeUri, id), rel, c.getLong(3)))
                     }
                 }
             }
-            if (result.size > MAX_FOLDER_FILES) throw IOException("Mehr als $MAX_FOLDER_FILES Dateien im Ordner")
+            if (files.size > MAX_FOLDER_FILES) throw IOException("Mehr als $MAX_FOLDER_FILES Dateien im Ordner")
         }
-        return result
+        return TreeScan(name, rootDoc, originalPath(treeUri, rootId), files, dirs, truncated)
+    }
+
+    /** Löscht den ganzen Originalordner (nach erfolgreicher Übernahme in den Tresor). */
+    fun deleteOriginalFolder(rootDocUri: Uri, origPath: String?): Boolean {
+        if (runCatching { DocumentsContract.deleteDocument(resolver, rootDocUri) }.getOrDefault(false)) return true
+        if (origPath != null && StorageAccess.granted(context)) {
+            val folder = File(origPath)
+            return folder.deleteRecursively() || !folder.exists()
+        }
+        return false
+    }
+
+    fun listFolders(key: ByteArray): List<FolderRecord> =
+        dir.listFiles().orEmpty()
+            .filter { it.name.endsWith(".dir") }
+            .mapNotNull { file ->
+                val id = file.name.removeSuffix(".dir")
+                runCatching {
+                    val json = JSONObject(String(Crypto.open(key, file.readBytes(), aad("dir", id)), Charsets.UTF_8))
+                    val dirs = json.optJSONArray("dirs")
+                    FolderRecord(
+                        id = id,
+                        name = json.getString("name"),
+                        origName = json.optString("origName", json.getString("name")),
+                        origPath = if (json.has("origPath")) json.getString("origPath") else null,
+                        dirs = if (dirs == null) emptyList() else List(dirs.length()) { dirs.getString(it) },
+                        added = json.optLong("added", 0L)
+                    )
+                }.getOrNull()
+            }
+
+    fun saveFolder(key: ByteArray, record: FolderRecord) {
+        val json = JSONObject()
+            .put("name", record.name)
+            .put("origName", record.origName)
+            .put("dirs", JSONArray(record.dirs))
+            .put("added", record.added)
+        if (record.origPath != null) json.put("origPath", record.origPath)
+        File(dir, "${record.id}.dir").writeBytes(Crypto.seal(key, json.toString().toByteArray(), aad("dir", record.id)))
+    }
+
+    fun deleteFolderRecord(record: FolderRecord) {
+        File(dir, "${record.id}.dir").delete()
     }
 
     /**
-     * Entschlüsselt [items] in den gewählten Zielordner. Der Ordner [baseFolder] wird dort
-     * mitsamt Unterordnern neu angelegt. Gibt die Anzahl fehlgeschlagener Dateien zurück.
+     * Stellt [items] (alle aus dem Tresor-Ordner [vaultBase]) im Dateisystem unter [targetRoot]
+     * wieder her: gleiche Unterordner (auch leere aus [dirs]), gleiche Namen, gleiches
+     * Änderungsdatum. Benötigt "Zugriff auf alle Dateien". Gibt die Anzahl Fehler zurück.
+     */
+    fun restoreToPath(
+        key: ByteArray,
+        items: List<VaultItem>,
+        vaultBase: String,
+        targetRoot: File,
+        dirs: List<String>,
+        onProgress: (Int) -> Unit
+    ): Int {
+        targetRoot.mkdirs()
+        if (!targetRoot.isDirectory) throw IOException("Ordner ${targetRoot.path} kann nicht erstellt werden")
+        dirs.forEach { File(targetRoot, it).mkdirs() }
+        val written = mutableListOf<String>()
+        var failed = 0
+        items.forEachIndexed { index, item ->
+            onProgress(index)
+            val rel = item.folder.removePrefix(vaultBase).removePrefix("/")
+            val targetDir = if (rel.isEmpty()) targetRoot else File(targetRoot, rel)
+            val ok = runCatching {
+                targetDir.mkdirs()
+                val target = uniqueFile(targetDir, safeFileName(item.name))
+                try {
+                    FileOutputStream(target).use { fos ->
+                        val out = fos.buffered()
+                        File(dir, "${item.id}.data").inputStream().buffered().use { input ->
+                            FileCrypto.decrypt(key, item.id.toByteArray(), input, out)
+                        }
+                        out.flush()
+                        fos.fd.sync()
+                    }
+                } catch (e: Exception) {
+                    target.delete()
+                    throw e
+                }
+                if (item.mtime > 0) target.setLastModified(item.mtime)
+                written += target.path
+            }.isSuccess
+            if (!ok) failed++
+        }
+        // Damit Galerie & Co. die Dateien sofort wieder sehen
+        if (written.isNotEmpty()) MediaScannerConnection.scanFile(context, written.toTypedArray(), null, null)
+        return failed
+    }
+
+    /**
+     * Entschlüsselt [items] (aus dem Tresor-Ordner [vaultBase]) in einen vom Benutzer gewählten
+     * Zielordner. Dort wird der Ordner [targetName] samt Unterordnern ([extraDirs] auch leer) angelegt.
      */
     fun exportToTree(
         key: ByteArray,
         items: List<VaultItem>,
-        baseFolder: String,
+        vaultBase: String,
+        targetName: String,
+        extraDirs: List<String>,
         treeUri: Uri,
         onProgress: (Int) -> Unit
     ): Int {
         val root = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
-        val parentPrefix = baseFolder.substringBeforeLast('/', "").let { if (it.isEmpty()) "" else "$it/" }
         val dirs = HashMap<String, Uri>()
         dirs[""] = root
         fun dir(path: String): Uri {
@@ -241,11 +380,14 @@ class VaultRepository(private val context: Context) {
             dirs[path] = created
             return created
         }
+        dir(targetName)
+        extraDirs.forEach { runCatching { dir("$targetName/$it") } }
         var failed = 0
         items.forEachIndexed { index, item ->
             onProgress(index)
             val ok = runCatching {
-                val target = dir(item.folder.removePrefix(parentPrefix))
+                val rel = item.folder.removePrefix(vaultBase).removePrefix("/")
+                val target = dir(if (rel.isEmpty()) targetName else "$targetName/$rel")
                 val file = DocumentsContract.createDocument(resolver, target, item.mime, item.name)
                     ?: throw IOException("Datei konnte nicht erstellt werden")
                 export(key, item, file)
@@ -253,6 +395,38 @@ class VaultRepository(private val context: Context) {
             if (!ok) failed++
         }
         return failed
+    }
+
+    /** Leitet aus einem SAF-Ordner den echten Dateipfad ab (nur für den internen Speicher/SD-Karte). */
+    private fun originalPath(treeUri: Uri, docId: String): String? = when (treeUri.authority) {
+        "com.android.externalstorage.documents" -> {
+            val volume = docId.substringBefore(':')
+            val rel = docId.substringAfter(':', "")
+            @Suppress("DEPRECATION")
+            val primary = Environment.getExternalStorageDirectory().path
+            val base = when {
+                volume.equals("primary", ignoreCase = true) -> primary
+                volume == "home" -> "$primary/Documents"
+                else -> "/storage/$volume"
+            }
+            if (rel.isEmpty()) base else "$base/$rel"
+        }
+        "com.android.providers.downloads.documents" ->
+            if (docId.startsWith("raw:")) docId.removePrefix("raw:") else null
+        else -> null
+    }
+
+    private fun uniqueFile(folder: File, name: String): File {
+        var file = File(folder, name)
+        if (!file.exists()) return file
+        val base = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "").let { if (it.isEmpty() || it == name) "" else ".$it" }
+        var n = 1
+        while (file.exists()) {
+            file = File(folder, "$base ($n)$ext")
+            n++
+        }
+        return file
     }
 
     private fun safeFolderName(name: String): String =

@@ -15,6 +15,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ch.eshopit.tresor.TresorApp
+import ch.eshopit.tresor.vault.FolderRecord
 import ch.eshopit.tresor.vault.VaultItem
 import ch.eshopit.tresor.vault.VaultLockedException
 import ch.eshopit.tresor.vault.VaultSession
@@ -25,10 +26,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.UUID
 import javax.crypto.Cipher
 
 data class UiState(
     val items: List<VaultItem> = emptyList(),
+    val folders: List<FolderRecord> = emptyList(),
     val busy: String? = null,
     val message: String? = null,
     val pinBusy: Boolean = false,
@@ -204,30 +208,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refresh() {
         if (!VaultSession.unlocked.value) return
-        val items = withContext(Dispatchers.IO) {
-            runCatching { withKey { repo.list(it) } }.getOrDefault(emptyList())
+        val (items, folders) = withContext(Dispatchers.IO) {
+            runCatching { withKey { repo.list(it) to repo.listFolders(it) } }
+                .getOrDefault(emptyList<VaultItem>() to emptyList())
         }
-        _state.update { it.copy(items = items) }
+        _state.update { it.copy(items = items, folders = folders) }
     }
 
-    fun importUris(uris: List<Uri>) = importSources(uris.map { it to "" })
-
-    /** Verschlüsselt alle Dateien eines Ordners (inkl. Unterordner); die Struktur bleibt erhalten. */
-    fun importFolder(treeUri: Uri) {
-        viewModelScope.launch {
-            _state.update { it.copy(busy = "Ordner wird gelesen …") }
-            val files = withContext(Dispatchers.IO) { runCatching { repo.listTree(treeUri) } }
-            _state.update { it.copy(busy = null) }
-            files
-                .onSuccess { list ->
-                    if (list.isEmpty()) showMessage("Der Ordner enthält keine Dateien")
-                    else importSources(list.map { it.uri to it.folder })
-                }
-                .onFailure { showMessage("Ordner konnte nicht gelesen werden: ${it.message}") }
-        }
-    }
-
-    private fun importSources(sources: List<Pair<Uri, String>>) {
+    fun importUris(uris: List<Uri>) {
         viewModelScope.launch {
             val key = try {
                 VaultSession.keyCopy()
@@ -239,9 +227,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             var failed = 0
             var originalsKept = 0
             try {
-                sources.forEachIndexed { index, (uri, folder) ->
-                    _state.update { it.copy(busy = "Verschlüssele ${index + 1} von ${sources.size} …") }
-                    val result = withContext(Dispatchers.IO) { runCatching { repo.import(key, uri, folder) } }
+                uris.forEachIndexed { index, uri ->
+                    _state.update { it.copy(busy = "Verschlüssele ${index + 1} von ${uris.size} …") }
+                    val result = withContext(Dispatchers.IO) { runCatching { repo.import(key, uri) } }
                     if (result.isSuccess) {
                         ok++
                         if (deleteOriginals && !withContext(Dispatchers.IO) { repo.deleteOriginal(uri) }) {
@@ -264,25 +252,130 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------------------------------------------------------------- Ordner im Tresor
+    // ---------------------------------------------------------------- Ganze Ordner
 
-    /** Ordner, der gerade über die Ordnerauswahl entschlüsselt wird. */
-    var pendingExportFolder: String? = null
+    /**
+     * Verschlüsselt einen ganzen Ordner (inkl. Unterordner, auch leere) und legt ihn im Tresor
+     * als Ordner an. Ist "Originale löschen" aktiv und hat alles geklappt, wird der
+     * Originalordner komplett gelöscht.
+     */
+    fun importFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            val key = try {
+                VaultSession.keyCopy()
+            } catch (e: VaultLockedException) {
+                showMessage("Tresor ist gesperrt – Import abgebrochen")
+                return@launch
+            }
+            try {
+                _state.update { it.copy(busy = "Ordner wird gelesen …") }
+                val scan = withContext(Dispatchers.IO) { runCatching { repo.scanTree(treeUri) } }
+                    .getOrElse {
+                        showMessage("Ordner konnte nicht gelesen werden: ${it.message}")
+                        return@launch
+                    }
+                val name = uniqueFolderName(scan.name)
+                val record = FolderRecord(
+                    id = UUID.randomUUID().toString(),
+                    name = name,
+                    origName = scan.name,
+                    origPath = scan.origPath,
+                    dirs = scan.dirs,
+                    added = System.currentTimeMillis()
+                )
+                withContext(Dispatchers.IO) { repo.saveFolder(key, record) }
 
-    fun itemsInFolder(folder: String): List<VaultItem> =
-        _state.value.items.filter { it.folder == folder || it.folder.startsWith("$folder/") }
+                var failed = 0
+                val imported = mutableListOf<Uri>()
+                scan.files.forEachIndexed { index, file ->
+                    _state.update { it.copy(busy = "Verschlüssele ${index + 1} von ${scan.files.size} …") }
+                    val folder = if (file.rel.isEmpty()) name else "$name/${file.rel}"
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { repo.import(key, file.uri, folder, file.mtime) }
+                    }
+                    if (result.isSuccess) imported += file.uri else failed++
+                }
 
-    fun finishFolderExport(treeUri: Uri?) {
-        val folder = pendingExportFolder
-        pendingExportFolder = null
-        if (treeUri == null || folder == null) return
-        val items = itemsInFolder(folder)
-        if (items.isEmpty()) return
+                var note = ""
+                if (deleteOriginals) {
+                    _state.update { it.copy(busy = "Originalordner wird gelöscht …") }
+                    if (failed == 0 && !scan.truncated) {
+                        val deleted = withContext(Dispatchers.IO) { repo.deleteOriginalFolder(scan.rootDocUri, scan.origPath) }
+                        note = if (deleted) ", Original gelöscht" else ". Der Originalordner konnte nicht gelöscht werden"
+                    } else {
+                        withContext(Dispatchers.IO) { imported.forEach { repo.deleteOriginal(it) } }
+                        note = ". Originalordner bleibt bestehen, da nicht alles übernommen wurde"
+                    }
+                }
+                refresh()
+                showMessage(buildString {
+                    append("Ordner „$name“ verschlüsselt: ${imported.size} Datei(en)")
+                    if (failed > 0) append(", $failed fehlgeschlagen")
+                    append(note)
+                })
+            } finally {
+                key.fill(0)
+                _state.update { it.copy(busy = null) }
+            }
+        }
+    }
+
+    private fun uniqueFolderName(base: String): String {
+        val taken = _state.value.folders.map { it.name }.toSet() +
+            _state.value.items.map { it.folder.substringBefore('/') }.toSet()
+        if (base !in taken) return base
+        var n = 2
+        while ("$base ($n)" in taken) n++
+        return "$base ($n)"
+    }
+
+    /** Alle Dateien im Tresor-Ordner [path] inkl. Unterordner. */
+    fun itemsInFolder(path: String): List<VaultItem> =
+        _state.value.items.filter { it.folder == path || it.folder.startsWith("$path/") }
+
+    /** Ordner-Datensatz, wenn [path] ein ganzer importierter Ordner ist. */
+    fun folderRecord(path: String): FolderRecord? = _state.value.folders.firstOrNull { it.name == path }
+
+    /** Stellt einen Ordner exakt am ursprünglichen Ort wieder her. */
+    fun restoreToOriginal(path: String, removeAfter: Boolean) {
+        val record = folderRecord(path) ?: return
+        val origPath = record.origPath ?: return
+        val items = itemsInFolder(path)
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     withKey { key ->
-                        repo.exportToTree(key, items, folder, treeUri) { i ->
+                        repo.restoreToPath(key, items, path, File(origPath), record.dirs) { i ->
+                            _state.update { it.copy(busy = "Stelle wieder her: ${i + 1} von ${items.size} …") }
+                        }
+                    }
+                }
+            }
+            _state.update { it.copy(busy = null) }
+            result
+                .onSuccess { failed -> finishRestore(path, failed, items.size, removeAfter, origPath) }
+                .onFailure { showMessage("Wiederherstellen fehlgeschlagen: ${it.message}") }
+        }
+    }
+
+    data class FolderExport(val path: String, val removeAfter: Boolean)
+
+    /** Ordner, der gerade über die Ordnerauswahl entschlüsselt wird. */
+    var pendingFolderExport: FolderExport? = null
+
+    fun finishFolderExport(treeUri: Uri?) {
+        val task = pendingFolderExport
+        pendingFolderExport = null
+        if (treeUri == null || task == null) return
+        val record = folderRecord(task.path)
+        val items = itemsInFolder(task.path)
+        val targetName = record?.origName ?: task.path.substringAfterLast('/')
+        val extraDirs = record?.dirs ?: dirsBelow(task.path)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    withKey { key ->
+                        repo.exportToTree(key, items, task.path, targetName, extraDirs, treeUri) { i ->
                             _state.update { it.copy(busy = "Entschlüssele ${i + 1} von ${items.size} …") }
                         }
                     }
@@ -290,25 +383,60 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             _state.update { it.copy(busy = null) }
             result
-                .onSuccess { failed ->
-                    showMessage(
-                        if (failed == 0) "Ordner „${folder.substringAfterLast('/')}“ entschlüsselt (${items.size} Dateien)"
-                        else "${items.size - failed} Dateien entschlüsselt, $failed fehlgeschlagen"
-                    )
-                }
+                .onSuccess { failed -> finishRestore(task.path, failed, items.size, task.removeAfter, null) }
                 .onFailure { showMessage("Entschlüsseln fehlgeschlagen: ${it.message}") }
         }
     }
 
-    fun deleteFolder(folder: String) {
-        val items = itemsInFolder(folder)
-        val ids = items.map { it.id }.toSet()
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { items.forEach(repo::delete) }
-            ids.forEach(thumbCache::remove)
-            _state.update { s -> s.copy(items = s.items.filterNot { it.id in ids }) }
-            showMessage("Ordner „${folder.substringAfterLast('/')}“ gelöscht (${items.size} Dateien)")
+    private suspend fun finishRestore(path: String, failed: Int, total: Int, removeAfter: Boolean, where: String?) {
+        val label = folderRecord(path)?.origName ?: path.substringAfterLast('/')
+        if (failed > 0) {
+            showMessage("${total - failed} von $total Dateien wiederhergestellt, $failed fehlgeschlagen – der Ordner bleibt im Tresor")
+            return
         }
+        if (removeAfter) removeFolder(path)
+        showMessage(buildString {
+            append("„$label“ wiederhergestellt ($total Dateien)")
+            if (where != null) append(" in $where")
+            if (removeAfter) append(" und aus dem Tresor entfernt")
+        })
+    }
+
+    /** Unterordner (relativ) eines Tresor-Ordners, der selbst kein ganzer importierter Ordner ist. */
+    private fun dirsBelow(path: String): List<String> {
+        val record = _state.value.folders.firstOrNull { path.startsWith(it.name + "/") } ?: return emptyList()
+        val rel = path.removePrefix(record.name + "/")
+        return record.dirs.filter { it.startsWith("$rel/") }.map { it.removePrefix("$rel/") }
+    }
+
+    fun deleteFolder(path: String) {
+        viewModelScope.launch {
+            val count = itemsInFolder(path).size
+            removeFolder(path)
+            showMessage("Ordner „${path.substringAfterLast('/')}“ gelöscht ($count Dateien)")
+        }
+    }
+
+    /** Entfernt einen Ordner samt Inhalt aus dem Tresor. */
+    private suspend fun removeFolder(path: String) {
+        val items = itemsInFolder(path)
+        val ids = items.map { it.id }.toSet()
+        val record = folderRecord(path)
+        val parent = _state.value.folders.firstOrNull { path.startsWith(it.name + "/") }
+        withContext(Dispatchers.IO) {
+            items.forEach(repo::delete)
+            when {
+                record != null -> repo.deleteFolderRecord(record)
+                parent != null -> runCatching {
+                    val rel = path.removePrefix(parent.name + "/")
+                    withKey { key ->
+                        repo.saveFolder(key, parent.copy(dirs = parent.dirs.filterNot { it == rel || it.startsWith("$rel/") }))
+                    }
+                }
+            }
+        }
+        ids.forEach(thumbCache::remove)
+        refresh()
     }
 
     fun finishExport(dest: Uri?) {

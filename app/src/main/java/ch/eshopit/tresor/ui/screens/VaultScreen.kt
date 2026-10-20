@@ -1,12 +1,7 @@
 package ch.eshopit.tresor.ui.screens
 
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.FilterChip
 import android.text.format.Formatter
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -16,6 +11,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,28 +20,34 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -66,8 +68,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -81,12 +83,16 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import ch.eshopit.tresor.ui.AppViewModel
 import ch.eshopit.tresor.ui.UiState
 import ch.eshopit.tresor.ui.VaultActions
+import ch.eshopit.tresor.vault.StorageAccess
 import ch.eshopit.tresor.vault.VaultItem
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -97,57 +103,92 @@ fun VaultScreen(
     snackbar: SnackbarHostState,
     actions: VaultActions
 ) {
-    var filter by rememberSaveable { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    var filter by rememberSaveable { mutableStateOf(0) }
+    var currentPath by rememberSaveable { mutableStateOf("") }
     var addMenu by remember { mutableStateOf(false) }
     var sheetItem by remember { mutableStateOf<VaultItem?>(null) }
     var confirmDelete by remember { mutableStateOf<VaultItem?>(null) }
-    var folderSel by rememberSaveable { mutableStateOf<String?>(null) }
+    var folderSheet by remember { mutableStateOf<String?>(null) }
+    var restoreFolder by remember { mutableStateOf<String?>(null) }
     var confirmFolderDelete by remember { mutableStateOf<String?>(null) }
 
-    val folders = state.items.map { it.folder }.filter { it.isNotEmpty() }.distinct().sorted()
-    val activeFolder = folderSel?.takeIf { it in folders }
-    val shownByType = when (filter) {
-        1 -> state.items.filter { it.isImage || it.isVideo }
-        2 -> state.items.filterNot { it.isImage || it.isVideo }
-        else -> state.items
+    // Berechtigung "Zugriff auf alle Dateien" nach Rückkehr aus den Einstellungen neu prüfen
+    var storageGranted by remember { mutableStateOf(StorageAccess.granted(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) storageGranted = StorageAccess.granted(context)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    val shown = if (activeFolder == null) shownByType
-    else shownByType.filter { it.folder == activeFolder || it.folder.startsWith("$activeFolder/") }
+
+    val allFolders = allFolderPaths(state)
+    // Ordner verschwunden (z. B. gelöscht)? Zurück zur obersten Ebene.
+    val path = if (currentPath.isEmpty() || currentPath in allFolders) currentPath else ""
+    val parentPath = path.substringBeforeLast('/', "")
+    BackHandler(enabled = path.isNotEmpty()) { currentPath = parentPath }
+
+    val subFolders = allFolders.filter { it.substringBeforeLast('/', "") == path && it.isNotEmpty() }.sorted()
+    val filesHere = state.items.filter { it.folder == path }
+    val shownFiles = when (filter) {
+        1 -> filesHere.filter { it.isImage || it.isVideo }
+        2 -> filesHere.filterNot { it.isImage || it.isVideo }
+        else -> filesHere
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Tresor") },
+                title = {
+                    Text(
+                        if (path.isEmpty()) "Tresor" else path.substringAfterLast('/'),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                navigationIcon = {
+                    if (path.isNotEmpty()) {
+                        IconButton(onClick = { currentPath = parentPath }) { Icon(Icons.Filled.ArrowBack, "Zurück") }
+                    }
+                },
                 actions = {
-                    IconButton(onClick = vm::openAppLock) { Icon(Icons.Filled.Apps, "App-Sperre") }
-                    IconButton(onClick = vm::openSettings) { Icon(Icons.Filled.Settings, "Einstellungen") }
+                    if (path.isNotEmpty()) {
+                        IconButton(onClick = { folderSheet = path }) { Icon(Icons.Filled.MoreVert, "Ordner-Aktionen") }
+                    } else {
+                        IconButton(onClick = vm::openAppLock) { Icon(Icons.Filled.Apps, "App-Sperre") }
+                        IconButton(onClick = vm::openSettings) { Icon(Icons.Filled.Settings, "Einstellungen") }
+                    }
                     IconButton(onClick = vm::lock) { Icon(Icons.Filled.Lock, "Sperren") }
                 }
             )
         },
         floatingActionButton = {
-            Box {
-                ExtendedFloatingActionButton(
-                    onClick = { addMenu = true },
-                    icon = { Icon(Icons.Filled.Add, null) },
-                    text = { Text("Verschlüsseln") }
-                )
-                DropdownMenu(expanded = addMenu, onDismissRequest = { addMenu = false }) {
-                    DropdownMenuItem(
-                        text = { Text("Bilder & Videos") },
-                        leadingIcon = { Icon(Icons.Filled.PhotoLibrary, null) },
-                        onClick = { addMenu = false; actions.import(arrayOf("image/*", "video/*")) }
+            if (path.isEmpty()) {
+                Box {
+                    ExtendedFloatingActionButton(
+                        onClick = { addMenu = true },
+                        icon = { Icon(Icons.Filled.Add, null) },
+                        text = { Text("Verschlüsseln") }
                     )
-                    DropdownMenuItem(
-                        text = { Text("Dateien") },
-                        leadingIcon = { Icon(Icons.Filled.Description, null) },
-                        onClick = { addMenu = false; actions.import(arrayOf("*/*")) }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Ganzer Ordner") },
-                        leadingIcon = { Icon(Icons.Filled.Folder, null) },
-                        onClick = { addMenu = false; actions.importFolder() }
-                    )
+                    DropdownMenu(expanded = addMenu, onDismissRequest = { addMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Bilder & Videos") },
+                            leadingIcon = { Icon(Icons.Filled.PhotoLibrary, null) },
+                            onClick = { addMenu = false; actions.import(arrayOf("image/*", "video/*")) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Dateien") },
+                            leadingIcon = { Icon(Icons.Filled.Description, null) },
+                            onClick = { addMenu = false; actions.import(arrayOf("*/*")) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Ganzer Ordner") },
+                            leadingIcon = { Icon(Icons.Filled.Folder, null) },
+                            onClick = { addMenu = false; actions.importFolder() }
+                        )
+                    }
                 }
             }
         },
@@ -160,18 +201,25 @@ fun VaultScreen(
                 }
             }
             state.busy?.let { BusyBar(it) }
-            if (folders.isNotEmpty()) {
-                FolderBar(
-                    folders = folders,
-                    selected = activeFolder,
-                    onSelect = { folderSel = it },
-                    onExport = actions.exportFolder,
-                    onDelete = { confirmFolderDelete = it }
+            if (path.isNotEmpty()) {
+                Text(
+                    path.replace("/", "  ›  "),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
 
-            if (shown.isEmpty()) {
-                EmptyState(Modifier.weight(1f))
+            if (subFolders.isEmpty() && shownFiles.isEmpty()) {
+                if (path.isEmpty() && state.items.isEmpty()) {
+                    EmptyState(Modifier.weight(1f))
+                } else {
+                    Box(Modifier.weight(1f).fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                        Text("Dieser Ordner ist leer", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             } else {
                 LazyVerticalGrid(
                     columns = GridCells.Adaptive(112.dp),
@@ -180,7 +228,15 @@ fun VaultScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    items(shown, key = { it.id }) { item ->
+                    items(subFolders, key = { "dir:$it" }) { folder ->
+                        FolderCell(
+                            name = folder.substringAfterLast('/'),
+                            fileCount = vm.itemsInFolder(folder).size,
+                            onClick = { currentPath = folder },
+                            onLongClick = { folderSheet = folder }
+                        )
+                    }
+                    items(shownFiles, key = { it.id }) { item ->
                         ItemCell(
                             item = item,
                             loadThumb = vm::thumbnail,
@@ -196,13 +252,7 @@ fun VaultScreen(
     sheetItem?.let { item ->
         ModalBottomSheet(onDismissRequest = { sheetItem = null }) {
             Column(Modifier.navigationBarsPadding().padding(bottom = 16.dp)) {
-                Text(
-                    item.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
+                SheetTitle(item.name)
                 if (item.isImage) {
                     SheetAction(Icons.Filled.Visibility, "Anzeigen") { sheetItem = null; vm.openViewer(item) }
                 }
@@ -213,17 +263,54 @@ fun VaultScreen(
         }
     }
 
+    folderSheet?.let { folder ->
+        ModalBottomSheet(onDismissRequest = { folderSheet = null }) {
+            Column(Modifier.navigationBarsPadding().padding(bottom = 16.dp)) {
+                SheetTitle(folder.substringAfterLast('/'))
+                SheetAction(Icons.Filled.Restore, "Wiederherstellen …") { folderSheet = null; restoreFolder = folder }
+                SheetAction(Icons.Filled.Delete, "Ordner löschen", danger = true) {
+                    folderSheet = null
+                    confirmFolderDelete = folder
+                }
+            }
+        }
+    }
+
+    restoreFolder?.let { folder ->
+        RestoreDialog(
+            folder = folder,
+            originalPath = vm.folderRecord(folder)?.origPath,
+            fileCount = vm.itemsInFolder(folder).size,
+            removeDefault = vm.deleteOriginals,
+            storageGranted = storageGranted,
+            onRequestAccess = actions.requestStorageAccess,
+            onRestoreOriginal = { remove ->
+                restoreFolder = null
+                if (remove && folder == path) currentPath = parentPath
+                vm.restoreToOriginal(folder, remove)
+            },
+            onChooseTarget = { remove ->
+                restoreFolder = null
+                actions.exportFolder(folder, remove)
+            },
+            onDismiss = { restoreFolder = null }
+        )
+    }
+
     confirmFolderDelete?.let { folder ->
         AlertDialog(
             onDismissRequest = { confirmFolderDelete = null },
             title = { Text("Ordner löschen?") },
             text = {
-                Text("Alle ${vm.itemsInFolder(folder).size} Dateien in „$folder“ werden endgültig aus dem Tresor gelöscht.")
+                Text(
+                    "„${folder.substringAfterLast('/')}“ mit allen ${vm.itemsInFolder(folder).size} Dateien " +
+                        "wird endgültig aus dem Tresor gelöscht."
+                )
             },
             confirmButton = {
                 TextButton(onClick = {
                     confirmFolderDelete = null
-                    folderSel = null
+                    if (folder == path || path.startsWith("$folder/")) currentPath = folder.substringBeforeLast('/', "")
                     vm.deleteFolder(folder)
                 }) { Text("Löschen", color = MaterialTheme.colorScheme.error) }
             },
@@ -234,6 +321,86 @@ fun VaultScreen(
     confirmDelete?.let { item ->
         DeleteDialog(item, onConfirm = { confirmDelete = null; vm.delete(item) }, onDismiss = { confirmDelete = null })
     }
+}
+
+/** Alle Ordnerpfade im Tresor (aus Ordner-Datensätzen, auch leere Unterordner, und aus Dateien). */
+private fun allFolderPaths(state: UiState): Set<String> {
+    val result = HashSet<String>()
+    fun addWithParents(path: String) {
+        var p = path
+        while (p.isNotEmpty() && result.add(p)) p = p.substringBeforeLast('/', "")
+    }
+    state.folders.forEach { record ->
+        addWithParents(record.name)
+        record.dirs.forEach { addWithParents("${record.name}/$it") }
+    }
+    state.items.forEach { addWithParents(it.folder) }
+    return result
+}
+
+@Composable
+private fun RestoreDialog(
+    folder: String,
+    originalPath: String?,
+    fileCount: Int,
+    removeDefault: Boolean,
+    storageGranted: Boolean,
+    onRequestAccess: () -> Unit,
+    onRestoreOriginal: (remove: Boolean) -> Unit,
+    onChooseTarget: (remove: Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var remove by remember { mutableStateOf(removeDefault) }
+    val canRestoreOriginal = originalPath != null && storageGranted
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("„${folder.substringAfterLast('/')}“ wiederherstellen") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("$fileCount Datei(en) werden entschlüsselt – mit allen Unterordnern und Originalnamen.")
+                if (originalPath != null) {
+                    Text("Originalort:", style = MaterialTheme.typography.labelMedium)
+                    Text(originalPath, style = MaterialTheme.typography.bodySmall)
+                    if (!storageGranted) {
+                        Text(
+                            "Für die Wiederherstellung am Originalort braucht Tresor die Berechtigung " +
+                                "„Zugriff auf alle Dateien“.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                        TextButton(onClick = onRequestAccess) { Text("Berechtigung erteilen") }
+                    }
+                } else {
+                    Text(
+                        "Der Originalort ist nicht bekannt – bitte einen Zielordner wählen.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clickable { remove = !remove }
+                ) {
+                    Checkbox(checked = remove, onCheckedChange = { remove = it })
+                    Text("Danach aus dem Tresor entfernen")
+                }
+            }
+        },
+        confirmButton = {
+            if (canRestoreOriginal) {
+                TextButton(onClick = { onRestoreOriginal(remove) }) { Text("Am Originalort") }
+            } else {
+                TextButton(onClick = { onChooseTarget(remove) }) { Text("Zielordner wählen") }
+            }
+        },
+        dismissButton = {
+            Row {
+                if (canRestoreOriginal) {
+                    TextButton(onClick = { onChooseTarget(remove) }) { Text("Anderer Ort") }
+                }
+                TextButton(onClick = onDismiss) { Text("Abbrechen") }
+            }
+        }
+    )
 }
 
 @Composable
@@ -259,6 +426,18 @@ fun DeleteDialog(item: VaultItem, onConfirm: () -> Unit, onDismiss: () -> Unit) 
 }
 
 @Composable
+private fun SheetTitle(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleMedium,
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
 private fun SheetAction(icon: ImageVector, label: String, danger: Boolean = false, onClick: () -> Unit) {
     val color = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
     ListItem(
@@ -281,12 +460,47 @@ private fun EmptyState(modifier: Modifier) {
             Text("Noch nichts im Tresor", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             Text(
-                "Tippe auf „Verschlüsseln“, um Bilder oder Dateien hinzuzufügen. " +
+                "Tippe auf „Verschlüsseln“, um Bilder, Dateien oder ganze Ordner hinzuzufügen. " +
                     "Sie werden mit AES-256 verschlüsselt und nur in dieser App gespeichert.",
                 textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FolderCell(name: String, fileCount: Int, onClick: () -> Unit, onLongClick: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.medium)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .background(MaterialTheme.colorScheme.secondaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                Icons.Filled.Folder, null,
+                Modifier.size(56.dp),
+                tint = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+        }
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+            Text(name, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (fileCount == 1) "1 Datei" else "$fileCount Dateien",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.width(4.dp))
+            }
         }
     }
 }
@@ -354,53 +568,4 @@ private fun iconFor(mime: String): ImageVector = when {
     mime == "application/pdf" -> Icons.Filled.PictureAsPdf
     mime.contains("zip") || mime.contains("compressed") || mime.contains("tar") -> Icons.Filled.FolderZip
     else -> Icons.Filled.Description
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun FolderBar(
-    folders: List<String>,
-    selected: String?,
-    onSelect: (String?) -> Unit,
-    onExport: (String) -> Unit,
-    onDelete: (String) -> Unit
-) {
-    LazyRow(
-        contentPadding = PaddingValues(horizontal = 12.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 8.dp)
-    ) {
-        item {
-            FilterChip(selected = selected == null, onClick = { onSelect(null) }, label = { Text("Alle") })
-        }
-        items(folders) { folder ->
-            FilterChip(
-                selected = selected == folder,
-                onClick = { onSelect(if (selected == folder) null else folder) },
-                label = { Text(folder) },
-                leadingIcon = { Icon(Icons.Filled.Folder, null, Modifier.size(18.dp)) }
-            )
-        }
-    }
-    if (selected != null) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            AssistChip(
-                onClick = { onExport(selected) },
-                label = { Text("Ordner entschlüsseln") },
-                leadingIcon = { Icon(Icons.Filled.Download, null, Modifier.size(18.dp)) }
-            )
-            AssistChip(
-                onClick = { onDelete(selected) },
-                label = { Text("Ordner löschen") },
-                leadingIcon = { Icon(Icons.Filled.Delete, null, Modifier.size(18.dp)) }
-            )
-        }
-    }
 }
